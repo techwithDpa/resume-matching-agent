@@ -235,12 +235,13 @@ def extract_requirements(jd: str) -> dict:
                 "You extract hiring requirements from a job description or a recruiter's "
                 "search request. Separate non-negotiable must-have skills from nice-to-have "
                 "ones. Keep skills atomic (one technology each). Only skills the text states "
-                "as required are must-have. If the request is terse (e.g. 'React devs with 3+ "
+                "as required are must-have. When the text offers alternatives ('X or Y'), "
+                "neither is must-have: list them as nice-to-have. If the request is terse (e.g. 'React devs with 3+ "
                 "years'), add 2-4 skills that commonly accompany the role as nice-to-have so "
                 "candidates can be differentiated. Prefer these canonical skill names when "
                 f"they apply: {', '.join(SKILL_VOCAB)}.")),
             HumanMessage(content=jd),
-        ])
+        ], effort="low")
         out = req.model_dump()
         out["source"] = "llm"
     except Exception:
@@ -600,6 +601,16 @@ def shortlist_view(shortlist: list[dict]) -> list[dict]:
              "final_score": c["final_score"], "decision": c["verdict"]["decision"],
              "experience_years": c["experience_years"],
              "missing_must_have": c.get("missing_must_have", [])} for c in shortlist]
+
+
+def tool_specs(tools: list[StructuredTool]) -> list[dict]:
+    """LangChain tools -> Claude Messages API tool definitions."""
+    specs = []
+    for t in tools:
+        schema = t.args_schema.model_json_schema() if t.args_schema else {"type": "object", "properties": {}}
+        schema.pop("title", None)
+        specs.append({"name": t.name, "description": t.description, "input_schema": schema})
+    return specs
 
 
 def make_tools(ctx: dict) -> list[StructuredTool]:

@@ -1,8 +1,7 @@
-# Agent framework + LLM (OpenRouter via the OpenAI-compatible API)
+# Agent framework + LLM (Anthropic Claude API)
 langgraph>=1.0.0               # state machine, interrupts, checkpointing
-langchain-core>=1.0.0          # messages, tools
-langchain-openai>=1.0.0        # ChatOpenAI pointed at OpenRouter
-openai>=1.40.0
+langchain-core>=1.0.0          # messages, tool schemas
+anthropic>=2.0.0               # official Claude SDK (claude-sonnet-5-5)
 
 # RAG stack from Milestone 2 (local, free)
 sentence-transformers>=3.0.0   # all-MiniLM-L6-v2 embeddings

@@ -1,6 +1,6 @@
 #!/usr/bin/env bash
 # Paced walkthrough of the agent for screen recording (~5-6 min live).
-#   ./demo.sh            # live LLM (needs OPENROUTER_API_KEY in .env)
+#   ./demo.sh            # live LLM (needs ANTHROPIC_API_KEY in .env)
 #   ./demo.sh --offline  # heuristic fallbacks, no API calls
 set -euo pipefail
 cd "$(dirname "$0")"

@@ -32,8 +32,7 @@ import uuid
 from datetime import datetime
 from typing import Annotated, Iterator, TypedDict
 
-from langchain_core.messages import (AIMessage, AnyMessage, HumanMessage, SystemMessage,
-                                     ToolMessage)
+from langchain_core.messages import AIMessage, AnyMessage, HumanMessage, SystemMessage
 from langgraph.checkpoint.memory import MemorySaver
 from langgraph.config import get_stream_writer
 from langgraph.graph import END, START, StateGraph
@@ -154,7 +153,10 @@ def rank_candidates(state: AgentState) -> dict:
         shortlist.append({**r, "round1_score": r["match_score"], "fit_score": a["fit_score"],
                           "final_score": T.final_score(r["match_score"], a["fit_score"]),
                           "analysis": a, "verdict": verdicts[cid]})
-    shortlist.sort(key=lambda c: (c["meets_requirements"], c["final_score"]), reverse=True)
+    # final ranking: qualified first, then the round-3 recommendation, then score
+    order = {"hire": 2, "maybe": 1, "no-hire": 0}
+    shortlist.sort(key=lambda c: (c["meets_requirements"], order[c["verdict"]["decision"]],
+                                  c["final_score"]), reverse=True)
     for i, c in enumerate(shortlist, 1):
         c["rank"] = i
 
@@ -214,7 +216,7 @@ def refine_requirements(state: AgentState) -> dict:
                 f"prefer these canonical names: {', '.join(T.SKILL_VOCAB)}.")),
             HumanMessage(content=f"CURRENT\n{json.dumps({k: old[k] for k in ('role_title', 'role_summary', 'must_have', 'nice_to_have', 'min_years')})}"
                                  f"\n\nINSTRUCTION\n{state['query']}"),
-        ])
+        ], effort="low")
         new = out.model_dump()
         changes = new.pop("changes")
         new["source"] = "llm"
@@ -241,6 +243,11 @@ components, generate interview questions, read resumes, and save files when aske
 Ground every claim in tool output; never invent resume facts. Refer to candidates \
 by name and rank. Be concise; use markdown tables for comparisons.
 
+Candidate tools accept a rank ("#2"), a full name, or just a first name, and \
+search all 100 resumes, not only the shortlist. If a name is not in the shortlist \
+(e.g. "Jane"), call the tool with it anyway: it picks the best-scoring match, \
+scores that person on the fly and says so in its "notes". Report that note.
+
 CURRENT REQUIREMENTS (v{version}): {requirements}
 
 CURRENT SHORTLIST:
@@ -254,9 +261,7 @@ def chat_agent(state: AgentState) -> dict:
            ("requirements", "shortlist", "rank_changes", "requirement_changes", "requirements_history")}
     tools = T.make_tools(ctx)
     by_name = {t.name: t for t in tools}
-    try:
-        model = llm.get_llm().bind_tools(tools)
-    except llm.LLMUnavailable:
+    if llm.is_offline():
         answer = offline_answer(state["query"], ctx, lines, state["messages"])
         return {"messages": [AIMessage(content=answer)], "trace": lines}
 
@@ -267,29 +272,42 @@ def chat_agent(state: AgentState) -> dict:
         shortlist="\n".join(f"#{c['rank']} {c['candidate_name']} ({c['candidate_id']}) final={c['final_score']} "
                             f"{c['verdict']['decision']}" for c in ctx["shortlist"]))
     history = [m for m in state["messages"] if isinstance(m, (HumanMessage, AIMessage))][-HISTORY_WINDOW:]
-    msgs: list = [SystemMessage(content=system), *history]
+    msgs: list[dict] = [{"role": "user" if isinstance(m, HumanMessage) else "assistant", "content": m.content}
+                        for m in history]
+    while msgs and msgs[0]["role"] != "user":   # Messages API: first turn must be the user
+        msgs.pop(0)
     answer = ""
     for _ in range(MAX_TOOL_STEPS):
         try:
-            resp = model.invoke(msgs)
-        except Exception as e:   # API error / quota: degrade to the offline path
+            resp = llm.chat(system, msgs, T.tool_specs(tools))
+        except Exception as e:   # API error: degrade to the offline path
             _emit("chat_agent", f"LLM error ({type(e).__name__}); using offline tools", lines)
             answer = offline_answer(state["query"], ctx, lines, state["messages"])
             break
-        msgs.append(resp)
-        if not resp.tool_calls:
-            answer = resp.content if isinstance(resp.content, str) else str(resp.content)
+        for b in resp.content:
+            if b.type == "thinking" and b.thinking.strip():
+                _emit("chat_agent", "thinking: " + " ".join(b.thinking.split())[:160], lines)
+        if resp.stop_reason == "refusal":
+            _emit("chat_agent", "model declined; using offline tools", lines)
+            answer = offline_answer(state["query"], ctx, lines, state["messages"])
             break
-        for call in resp.tool_calls:
-            _emit("chat_agent", f"tool {call['name']}({_short(call['args'])})", lines)
+        msgs.append({"role": "assistant", "content": resp.content})   # keep thinking + tool_use blocks
+        calls = [b for b in resp.content if b.type == "tool_use"]
+        if not calls:
+            answer = "\n\n".join(b.text for b in resp.content if b.type == "text").strip()
+            break
+        results = []
+        for call in calls:
+            _emit("chat_agent", f"tool {call.name}({_short(call.input)})", lines)
             try:
-                result = by_name[call["name"]].invoke(call["args"])
+                result, is_error = by_name[call.name].invoke(call.input), False
             except Exception as e:
-                result = {"error": f"{type(e).__name__}: {e}"}
-            msgs.append(ToolMessage(content=json.dumps(result, default=str)[:12000],
-                                    tool_call_id=call["id"]))
+                result, is_error = {"error": f"{type(e).__name__}: {e}"}, True
+            results.append({"type": "tool_result", "tool_use_id": call.id, "is_error": is_error,
+                            "content": json.dumps(result, default=str)[:12000]})
+        msgs.append({"role": "user", "content": results})   # all results in one message
     else:
-        answer = "I hit the tool-step limit; here is what I found so far:\n\n" + str(msgs[-1].content)[:2000]
+        answer = "I hit the tool-step limit before finishing; please narrow the question."
     return {"messages": [AIMessage(content=answer)], "trace": lines}
 
 
@@ -331,7 +349,7 @@ def classify_intent(text: str, state: AgentState) -> str:
             SystemMessage(content=("Classify the recruiter's message. refine = change hiring criteria "
                                    "and re-rank; new_search = a different role/search; question = ask "
                                    "about candidates or files; end = finish the session.")),
-            HumanMessage(content=text)])
+            HumanMessage(content=text)], effort="low")
         if out.intent in {"refine", "new_search", "question", "end"}:
             return out.intent
     except Exception:
@@ -498,6 +516,11 @@ def render_report(state: AgentState) -> str:
     return "\n".join(out)
 
 
+def _clip(text: str, limit: int) -> str:
+    text = " ".join(text.split())
+    return text if len(text) <= limit else text[:limit].rsplit(" ", 1)[0].rstrip(",;") + "…"
+
+
 def chat_summary(state: AgentState, report_path: str) -> str:
     req, sl = state["requirements"], state["shortlist"]
     counts = {d: sum(c["verdict"]["decision"] == d for c in sl) for d in ("hire", "maybe", "no-hire")}
@@ -511,7 +534,7 @@ def chat_summary(state: AgentState, report_path: str) -> str:
             "| # | Candidate | Final | Verdict | Key reason |", "|---|---|---|---|---|"]
     for c in sl[:5]:
         out.append(f"| {c['rank']} | {c['candidate_name']} | {c['final_score']} | {c['verdict']['decision']} | "
-                   f"{c['verdict']['rationale'][:90]} |")
+                   f"{_clip(c['verdict']['rationale'], 110)} |")
     moves = [rc for rc in state.get("rank_changes") or [] if rc["change"] not in ("same",)]
     if moves:
         out += ["", "**Ranking changes:**"]

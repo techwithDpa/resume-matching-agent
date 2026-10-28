@@ -13,6 +13,7 @@ line; blank lines and lines starting with '#' are ignored.
 from __future__ import annotations
 
 import argparse
+import contextlib
 import os
 import sys
 import time
@@ -32,7 +33,10 @@ console = Console()
 def run_turn(session, text: str) -> None:
     console.print(f"\n[bold cyan]you ›[/] {escape(text)}")
     started = time.time()
-    with console.status("[dim]thinking…[/]", spinner="dots"):
+    # CHAT_NO_SPINNER=1 (set by demo/record_live.py) keeps recordings free of spinner frames
+    spinner = (contextlib.nullcontext() if os.environ.get("CHAT_NO_SPINNER")
+               else console.status("[dim]thinking…[/]", spinner="dots"))
+    with spinner:
         for ev in session.send(text):
             if ev["type"] == "trace":
                 console.print(f"  [dim]· {escape(f'[{ev['node']}] ' + ev['text'])}[/]")
